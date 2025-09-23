@@ -1,7 +1,6 @@
 package main
 
 import (
-	"cloud.google.com/go/storage"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -11,9 +10,11 @@ import (
 	"strings"
 	"time"
 
+	"cloud.google.com/go/storage"
+
 	"github.com/vbauerster/mpb/v7"
 	"github.com/vbauerster/mpb/v7/decor"
-	"golang.org/x/oauth2/google"
+	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 )
 
@@ -26,75 +27,91 @@ type Config struct {
 func main() {
 	ctx := context.Background()
 
-	// Load config
+	// Load appsetting.json
 	cfgFile, err := os.ReadFile("appsetting.json")
 	if err != nil {
-		panic(err)
+		panic(fmt.Errorf("failed to read config: %w", err))
 	}
 
+	// Parse JSON with nested "AppSetting"
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(cfgFile, &raw); err != nil {
-		panic(err)
+		panic(fmt.Errorf("failed to unmarshal json: %w", err))
 	}
 
 	var cfg Config
 	if err := json.Unmarshal(raw["AppSetting"], &cfg); err != nil {
-		panic(err)
+		panic(fmt.Errorf("failed to unmarshal AppSetting: %w", err))
 	}
 
+	// Remove "AppSetting" key, keep credentials
 	delete(raw, "AppSetting")
 	credBytes, _ := json.Marshal(raw)
 
+	// Initialize GCS client
 	client, err := storage.NewClient(ctx, option.WithCredentialsJSON(credBytes))
 	if err != nil {
-		panic(err)
+		panic(fmt.Errorf("failed to create GCS client: %w", err))
 	}
 	defer client.Close()
 
+	// Set today's date and prepare download dir
 	dateStr := time.Now().Format("20060102")
 	downloadDir := filepath.Join(cfg.PathDownload, dateStr)
-	os.MkdirAll(downloadDir, 0755)
+	if err := os.MkdirAll(downloadDir, 0755); err != nil {
+		panic(fmt.Errorf("failed to create download directory: %w", err))
+	}
 
+	// List matching .csv files from bucket
 	bkt := client.Bucket(cfg.BucketName)
 	it := bkt.Objects(ctx, nil)
 
 	var files []string
 	for {
 		attrs, err := it.Next()
-		if err == storage.Done {
+		if err == iterator.Done {
 			break
 		}
 		if err != nil {
-			panic(err)
+			panic(fmt.Errorf("failed to list bucket objects: %w", err))
 		}
-
 		if strings.HasSuffix(attrs.Name, ".csv") && strings.Contains(attrs.Name, dateStr) {
 			files = append(files, attrs.Name)
 		}
 	}
 
 	if len(files) == 0 {
-		fmt.Println("No CSV files found.")
+		fmt.Println("No CSV files found for today:", dateStr)
 		return
 	}
 
+	// Start progress container
 	p := mpb.New(mpb.WithWidth(60))
 
 	for _, name := range files {
 		obj := bkt.Object(name)
-		attrs, _ := obj.Attrs(ctx)
+		attrs, err := obj.Attrs(ctx)
+		if err != nil {
+			fmt.Printf("Failed to get attributes for %s: %v\n", name, err)
+			continue
+		}
 
 		filePath := filepath.Join(downloadDir, filepath.Base(name))
-		outFile, _ := os.Create(filePath)
-		defer outFile.Close()
+		outFile, err := os.Create(filePath)
+		if err != nil {
+			fmt.Printf("Failed to create file %s: %v\n", filePath, err)
+			continue
+		}
 
 		r, err := obj.NewReader(ctx)
 		if err != nil {
 			fmt.Printf("Error reading %s: %v\n", name, err)
+			outFile.Close()
 			continue
 		}
 
-		bar := p.New(attrs.Size,
+		bar := p.New(
+			attrs.Size,
 			mpb.BarStyle().Rbound("|").Lbound("|").Tip(">").Filler("="),
 			mpb.PrependDecorators(
 				decor.Name(filepath.Base(name), decor.WC{W: len(filepath.Base(name)) + 1, C: decor.DSyncWidth}),
@@ -109,6 +126,7 @@ func main() {
 		_, err = io.Copy(outFile, proxyReader)
 		_ = proxyReader.Close()
 		_ = r.Close()
+		_ = outFile.Close()
 
 		if err != nil {
 			fmt.Printf("Failed to download %s: %v\n", name, err)
@@ -118,5 +136,5 @@ func main() {
 	}
 
 	p.Wait()
-	fmt.Println("Download completed.")
+	fmt.Println("✅ Download completed.")
 }
